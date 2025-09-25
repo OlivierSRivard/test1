@@ -4,7 +4,7 @@ from pathlib import Path
 
 st.set_page_config(page_title="Home", layout="wide")
 
-APP_VERSION = "home-2025-09-25a" 
+APP_VERSION = "home-2025-09-25b" 
 
 with st.sidebar:
     st.write(f"App version: {APP_VERSION}")
