@@ -7,3 +7,5 @@ COPY . /app
 ENV PORT=10000
 EXPOSE 10000
 CMD ["streamlit","run","Home.py","--server.port=${PORT}","--server.address=0.0.0.0"]
+
+
