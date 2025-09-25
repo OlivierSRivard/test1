@@ -2,3 +2,18 @@
 headless = true
 enableCORS = false
 enableXsrfProtection = false
+
+[browser]
+gatherUsageStats = false
+
+[client]
+toolbarMode = "minimal"
+showErrorDetails = true
+
+[theme]
+base = "light"
+primaryColor = "#00529C"
+backgroundColor = "#F5F9FF"
+secondaryBackgroundColor = "#F5F5F5"
+textColor = "#0F172A"
+font = "sans serif"
