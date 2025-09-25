@@ -25,6 +25,10 @@ COPY . /app
 
 # Drop root for runtime
 RUN useradd -m appuser && chown -R appuser:appuser /app /opt/venv
+# Ensure HOME is correct for appuser (some frameworks look here for config)
+ENV HOME=/home/appuser
+RUN mkdir -p \C:\Users\rivo001/.streamlit && chown -R appuser:appuser \C:\Users\rivo001
+
 USER appuser
 
 # Optional (local dev convenience)
@@ -32,3 +36,4 @@ EXPOSE 8501
 
 # Start Streamlit
 CMD ["sh","-lc","streamlit run Home.py --server.port ${PORT:-8501} --server.address 0.0.0.0"]
+

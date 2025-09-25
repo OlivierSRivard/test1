@@ -1,3 +1,13 @@
+import os
+import streamlit as st
+
+def _get_secret(key, default=""):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.environ.get(key, default)
 # Home.py
 import os
 import streamlit as st
@@ -62,3 +72,4 @@ st.write("Use the links below to open pages:")
 st.page_link("pages/01_Company_Search.py", label="Company Search", icon="🔎")
 st.page_link("pages/02_ETF_Mean_Reversion.py", label="ETF Mean Reversion", icon="📈")
 st.page_link("pages/03_Margin__Optimization.py", label="Margin Optimization", icon="⚖️")
+
