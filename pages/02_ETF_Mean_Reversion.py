@@ -1,11 +1,18 @@
 # File: pages/02_ETF_Mean_Reversion.py
-# Purpose: Excel-driven ETF table (Yahoo-only), Top-10 below selected MA,
-#          count below selected MA, and Method #1 empirical mean-reversion probability.
+# Purpose: ETF mean-reversion dashboard using a prewarmed Parquet master + Parquet price cache.
+# - Reads master from data/cache/ETF_master_copy.parquet (fast; no Excel required)
+# - Loads cached history from data/cache/price_history.parquet (ideally 5y prewarmed)
+# - Appends only a tiny recent window from Yahoo (for freshness)
+# - Lets you ADD tickers (ALL CAPS) after pressing "Run backtest" and includes them in the run
+# - Robust probability calc: merges sparse bins and falls back to unconditional rate
 
 from __future__ import annotations
 
 import io
 import re
+import sys
+import hashlib
+import pathlib
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 
@@ -13,41 +20,43 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
+# Optional: gate by auth flag in session_state
+if not st.session_state.get("is_authed"):
+    st.markdown("""
+        <style>
+            [data-testid="stSidebar"] {display:none !important;}
+            [data-testid="stSidebarNav"] {display:none !important;}
+            [data-testid="collapsedControl"] {display:none !important;}
+        </style>
+    """, unsafe_allow_html=True)
+    try:
+        st.switch_page("Home.py")
+    except Exception:
+        st.stop()
+
+# ------------------------------ Page & Run Gate ------------------------------
 st.set_page_config(page_title="ETF Mean Reversion", layout="wide")
 st.title("ETF Mean Reversion")
 
-# --- Do nothing until user explicitly enables + runs ---
+# Persist run state so you can add tickers post-run
+if "run_ok" not in st.session_state:
+    st.session_state["run_ok"] = False
+
 enable = st.toggle("Enable this page", value=False, help="Prevents any heavy work until checked.")
-run = st.button("Run backtest")
-if not (enable and run):
+if st.button("Run backtest"):
+    st.session_state["run_ok"] = True
+
+if not (enable and st.session_state["run_ok"]):
     st.info("Toggle **Enable this page** and click **Run backtest** to load data.")
     st.stop()
 
-# --- DIAGNOSTIC (remove later) ---
-import os, sys, hashlib, pathlib, streamlit as st
-VERSION = "ETF page :: diag v5-top10plot"
-this_file = pathlib.Path(__file__).resolve()
-sha = hashlib.sha1(open(this_file, "rb").read()).hexdigest()[:12]
-st.info(f"Running: `{this_file}` • Python: `{sys.executable}` • SHA: {sha} • {VERSION}")
-# ---------------------------------
-
 # ------------------------------ Config ------------------------------
-MASTER_PATHS = [
-    Path("data") / "ETF project.xlsm",
-    Path("ETF project.xlsm"),
-]
-MASTER_SHEET = "Tickers"
-
-DEFAULT_HIST_PERIOD = "3y"  # for empirical stats
-SUPPORTED_PERIODS = ["2y", "3y", "5y"]
+MASTER_PARQUET = Path("data/cache/ETF_master_copy.parquet")  # prewarmed by tools/prewarm_data.py
+CACHE_PARQUET  = Path("data/cache/price_history.parquet")    # prewarmed price history (ideally ~5y)
+DEFAULT_HIST_PERIOD = "3y"                                   # only used when cache is missing
+SUPPORTED_PERIODS   = ["2y", "3y", "5y"]
 
 # ------------------------------ Helpers ------------------------------
-def _first_existing(paths: List[Path]) -> Optional[Path]:
-    for p in paths:
-        if p.exists():
-            return p
-    return None
-
 def _series_or_blank(df: pd.DataFrame, colname: Optional[str]) -> pd.Series:
     if colname:
         return df[colname].fillna("").astype(str).str.strip()
@@ -58,24 +67,11 @@ def _series_or_nan(df: pd.DataFrame, colname: Optional[str]) -> pd.Series:
         return df[colname]
     return pd.Series([np.nan] * len(df), index=df.index, dtype="float64")
 
-def _fmt_price(x):
-    return "" if pd.isna(x) else f"{x:.2f}"
-
-def _fmt_pct_str(x):
-    return "" if pd.isna(x) else f"{x:.2f}%"
-
-# ------------------------- Excel Master Loader -------------------------
-@st.cache_data(show_spinner=False)
-def _load_master_from_path(src: Path) -> pd.DataFrame:
-    df = pd.read_excel(src, sheet_name=MASTER_SHEET, engine="openpyxl")
-    return _normalize_master(df)
-
-@st.cache_data(show_spinner=False)
-def _load_master_from_bytes(content: bytes) -> pd.DataFrame:
-    df = pd.read_excel(io.BytesIO(content), sheet_name=MASTER_SHEET, engine="openpyxl")
-    return _normalize_master(df)
-
 def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize a master DataFrame into: Ticker, URL, Name, Brand, Expense Ratio (%), Category, Region.
+    Works for the prewarmed parquet (already tidy) or a raw sheet-like DataFrame.
+    """
     df = df.copy()
     df.columns = [str(c).strip().lower() for c in df.columns]
 
@@ -83,13 +79,13 @@ def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
         return df.columns[idx] if 0 <= idx < len(df.columns) else None
 
     col_map = {
-        "ticker": None,        # B
-        "fund_name": None,     # C
-        "hyperlink": None,     # D
-        "brand": None,         # E
-        "expense_ratio": None, # F
-        "focus": None,         # G
-        "region": None,        # H
+        "ticker": None,
+        "fund_name": None,
+        "hyperlink": None,
+        "brand": None,
+        "expense_ratio": None,
+        "focus": None,
+        "region": None,
     }
 
     for c in df.columns:
@@ -109,6 +105,7 @@ def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
         elif col_map["region"] is None and "region" in cl:
             col_map["region"] = c
 
+    # Fallback positional guesses (if user gave non-standard headers)
     col_map["ticker"]        = col_map["ticker"]        or _col_at(1)  # B
     col_map["fund_name"]     = col_map["fund_name"]     or _col_at(2)  # C
     col_map["hyperlink"]     = col_map["hyperlink"]     or _col_at(3)  # D
@@ -123,18 +120,11 @@ def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     if (col_map["fund_name"] is None) and (col_map["brand"] is None):
         required_for_min.append("Fund Name (column C) or Brand (column E)")
     if required_for_min:
-        raise ValueError(
-            f"Missing required columns in sheet '{MASTER_SHEET}': {', '.join(required_for_min)}"
-        )
+        raise ValueError("Missing required columns in master parquet: " + ", ".join(required_for_min))
 
-    tick_raw = df[col_map["ticker"]]
+    tick_raw   = df[col_map["ticker"]]
     ticker_ser = tick_raw.astype(str).str.strip().str.upper()
-
-    name_ser = (
-        _series_or_blank(df, col_map["fund_name"])
-        if col_map["fund_name"] else _series_or_blank(df, col_map["brand"])
-    )
-
+    name_ser   = _series_or_blank(df, col_map["fund_name"]) if col_map["fund_name"] else _series_or_blank(df, col_map["brand"])
     url_ser    = _series_or_blank(df, col_map["hyperlink"])
     brand_ser  = _series_or_blank(df, col_map["brand"])
     expense_raw = _series_or_nan(df, col_map["expense_ratio"])
@@ -151,11 +141,13 @@ def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
         "Region": region_ser,
     })
 
+    # Fill missing Name
     name_blank = out["Name"].eq("") | out["Name"].isna()
     out.loc[name_blank, "Name"] = out.loc[name_blank, "Brand"]
     name_blank = out["Name"].eq("") | out["Name"].isna()
     out.loc[name_blank, "Name"] = out.loc[name_blank, "Ticker"]
 
+    # Parse Expense Ratio to percent
     def _parse_expense(x):
         if pd.isna(x):
             return np.nan
@@ -183,12 +175,100 @@ def _normalize_master(df: pd.DataFrame) -> pd.DataFrame:
     out["Expense Ratio (%)"] = out["Expense Ratio Raw"].apply(_parse_expense).round(2)
     out.drop(columns=["Expense Ratio Raw"], inplace=True)
 
+    # Clean + dedupe
     out = out[~out["Ticker"].isna() & (out["Ticker"].str.strip() != "")]
     out = out.drop_duplicates(subset=["Ticker"]).reset_index(drop=True)
     return out
 
-# ----------------------------- Yahoo Snapshot -----------------------------
-@st.cache_data(show_spinner=False, ttl=3600)
+# ------------------------------ Master Loader (Parquet only) ------------------------------
+@st.cache_data(show_spinner=False)
+def _load_master_from_parquet(src: Path) -> pd.DataFrame:
+    if not src.exists():
+        raise FileNotFoundError(f"Master parquet not found: {src}. Run tools/prewarm_data.py first.")
+    raw = pd.read_parquet(src)
+    return _normalize_master(raw)
+
+# ---------------------------- Cached history loaders ----------------------------
+@st.cache_data(show_spinner=False, ttl=900)
+def _load_cached_history(parquet_path: Path, tickers: List[str]) -> Dict[str, pd.Series]:
+    """
+    Load cached (Date, Ticker, Close) from Parquet and return {ticker: Close Series}.
+    """
+    if not parquet_path.exists():
+        return {}
+    df = pd.read_parquet(parquet_path)
+    if df.empty:
+        return {}
+    df = df[df["Ticker"].isin(tickers)].copy()
+    out: Dict[str, pd.Series] = {}
+    for t, g in df.groupby("Ticker"):
+        s = g.sort_values("Date").set_index("Date")["Close"].astype(float)
+        s.index = pd.to_datetime(s.index).tz_localize(None)
+        s.name = t
+        out[t] = s
+    return out
+
+def _append_latest_5d(hist_map: Dict[str, pd.Series], tickers: List[str]) -> Dict[str, pd.Series]:
+    """
+    Download a small recent window (~10 calendar days) and append to existing series, de-duplicated.
+    """
+    try:
+        import yfinance as yf
+    except Exception:
+        return hist_map
+    if not tickers:
+        return hist_map
+
+    latest_any = None
+    for s in hist_map.values():
+        if s is not None and len(s):
+            last = s.index.max()
+            latest_any = last if (latest_any is None or last > latest_any) else latest_any
+
+    # If we have a last date, start a bit before; otherwise pull the last 10 days.
+    start = (latest_any - pd.Timedelta(days=10)) if latest_any is not None else (pd.Timestamp.utcnow() - pd.Timedelta(days=10))
+    start = pd.Timestamp(start).tz_localize(None)
+
+    data = yf.download(
+        tickers=tickers,
+        start=start.date().isoformat(),
+        interval="1d",
+        auto_adjust=False,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+
+    def _normalize(dfclose: pd.Series, t: str) -> pd.Series:
+        ser = dfclose.dropna().copy()
+        if isinstance(ser.index, pd.DatetimeIndex) and ser.index.tz is not None:
+            ser.index = ser.index.tz_localize(None)
+        ser.name = t
+        return ser
+
+    if isinstance(data, pd.DataFrame) and isinstance(data.columns, pd.MultiIndex):
+        for t in tickers:
+            try:
+                recent = _normalize(data[(t, "Close")], t)
+            except Exception:
+                continue
+            base = hist_map.get(t, pd.Series(dtype=float))
+            combined = pd.concat([base, recent]).sort_index()
+            hist_map[t] = combined[~combined.index.duplicated(keep="last")]
+    else:
+        # single-ticker fallback
+        try:
+            t0 = tickers[0]
+            recent = _normalize(data["Close"], t0)
+            base = hist_map.get(t0, pd.Series(dtype=float))
+            combined = pd.concat([base, recent]).sort_index()
+            hist_map[t0] = combined[~combined.index.duplicated(keep="last")]
+        except Exception:
+            pass
+    return hist_map
+
+# ---------------------------- Yahoo fallback fetchers ----------------------------
+@st.cache_data(show_spinner=False, ttl=7200)
 def _fetch_prices_yahoo_snapshot(tickers: List[str]) -> pd.DataFrame:
     """
     Fetch a 2y snapshot from Yahoo and compute Price, MA50/MA200, % spreads,
@@ -217,7 +297,6 @@ def _fetch_prices_yahoo_snapshot(tickers: List[str]) -> pd.DataFrame:
         if not t:
             continue
         price = ma50 = ma200 = pct_vs50 = pct_vs200 = None
-
         nav = None
         prem_disc_nav = None
         trailing_yield_pct = None
@@ -339,7 +418,7 @@ def _fetch_history_yahoo(tickers: List[str], period: str = DEFAULT_HIST_PERIOD) 
             pass
     return out
 
-# ----------------- Empirical Probability (Method #1, vectorized) -----------------
+# ----------------- Empirical Probability (Robust Method #1) -----------------
 def compute_empirical_reversion_prob(
     close: pd.Series,
     ma_window: int,
@@ -348,6 +427,14 @@ def compute_empirical_reversion_prob(
     bin_edges: np.ndarray,
     min_samples_per_bin: int = 30
 ) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Robust Method #1:
+    - Use z vs. rolling mean/stdev.
+    - Try the current bin; if sparse, merge with neighbors progressively (±1...±3).
+    - Relax min-samples floor in steps if still sparse.
+    - Final fallback: unconditional hit rate across all valid samples.
+    Returns (probability %, current_z, coverage %).
+    """
     if close is None or len(close) < (ma_window + H + 20):
         return (None, None, None)
 
@@ -357,9 +444,8 @@ def compute_empirical_reversion_prob(
     if valid.sum() < (ma_window + H):
         return (None, None, None)
 
-    z = (close - mu) / sd
+    z = ((close - mu) / sd)
     z = z.where(np.isfinite(z))
-
     abs_z = z.abs()
     fwd_min = abs_z.shift(-1).rolling(window=H, min_periods=H).min()
     hit = (fwd_min <= eps).astype(float).where(fwd_min.notna())
@@ -367,40 +453,47 @@ def compute_empirical_reversion_prob(
     z_vals = z.to_numpy()
     hit_vals = hit.to_numpy()
     mask = np.isfinite(z_vals) & np.isfinite(hit_vals)
-
-    if mask.sum() < min_samples_per_bin:
+    if mask.sum() < 10:
         return (None, float(z.iloc[-1]) if np.isfinite(z.iloc[-1]) else None, None)
 
     bins = np.digitize(z_vals, bin_edges)
+    total = int(mask.sum())
+
     probs_by_bin: Dict[int, float] = {}
     counts_by_bin: Dict[int, int] = {}
-
     for b in range(1, len(bin_edges) + 1):
         idx = mask & (bins == b)
         cnt = int(idx.sum())
-        if cnt >= min_samples_per_bin:
-            p = float(np.nanmean(hit_vals[idx]))
-            probs_by_bin[b] = p
+        if cnt > 0:
             counts_by_bin[b] = cnt
+            probs_by_bin[b] = float(np.nanmean(hit_vals[idx]))
 
     current_z = float(z.iloc[-1]) if np.isfinite(z.iloc[-1]) else None
     if current_z is None:
         return (None, None, None)
     current_bin = int(np.digitize([current_z], bin_edges)[0])
 
-    p_use = None
-    coverage = None
-    for b in [current_bin, current_bin - 1, current_bin + 1, current_bin - 2, current_bin + 2]:
-        if b in probs_by_bin:
-            p_use = probs_by_bin[b]
-            total = int(np.isfinite(hit_vals).sum())
-            coverage = counts_by_bin[b] / max(1, total)
-            break
+    floors = [min_samples_per_bin, max(20, min_samples_per_bin - 10), 15, 10, 5]
+    for floor in floors:
+        for radius in range(0, 4):  # merge ±0, ±1, ±2, ±3
+            merge_bins = [b for b in range(current_bin - radius, current_bin + radius + 1)
+                          if 1 <= b <= len(bin_edges)]
+            cnt = sum(counts_by_bin.get(b, 0) for b in merge_bins)
+            if cnt >= floor:
+                num = 0.0
+                for b in merge_bins:
+                    if b in probs_by_bin and b in counts_by_bin:
+                        num += probs_by_bin[b] * counts_by_bin[b]
+                p_use = num / cnt if cnt > 0 else np.nan
+                if np.isfinite(p_use):
+                    return (100.0 * p_use, current_z, 100.0 * (cnt / max(1, total)))
 
-    if p_use is None:
-        return (None, current_z, None)
+    # Final fallback: unconditional hit rate across all samples
+    base = float(np.nanmean(hit_vals[mask]))
+    if np.isfinite(base):
+        return (100.0 * base, current_z, 100.0)
 
-    return (100.0 * p_use, current_z, 100.0 * (coverage if coverage is not None else np.nan))
+    return (None, current_z, None)
 
 # ---------------------------- UI: Controls ----------------------------
 with st.sidebar:
@@ -415,33 +508,52 @@ with st.sidebar:
     eps = st.number_input("Band width ε (z-units)", min_value=0.05, max_value=1.00, value=0.20, step=0.05, format="%.2f")
     bin_width = st.selectbox("Z-bin width", options=[0.25, 0.5, 1.0], index=1)
     min_bin = st.number_input("Min samples per bin", min_value=10, max_value=200, value=30, step=5)
-    hist_period = st.selectbox("Historical period (Yahoo)", options=SUPPORTED_PERIODS, index=SUPPORTED_PERIODS.index(DEFAULT_HIST_PERIOD))
+    hist_period = st.selectbox(
+        "Historical period for Yahoo fallback",
+        options=SUPPORTED_PERIODS,
+        index=SUPPORTED_PERIODS.index(DEFAULT_HIST_PERIOD),
+        help="Used only when cache is missing for some tickers."
+    )
 
-# ---------------------------- Load Master ----------------------------
-src_path = _first_existing(MASTER_PATHS)
-uploaded = None
-if not src_path:
-    with st.expander("Excel master not found — upload it here"):
-        uploaded = st.file_uploader("Upload 'ETF project.xlsm' (sheet 'Tickers')", type=["xlsm", "xlsx"], accept_multiple_files=False)
-
-base: Optional[pd.DataFrame] = None
+# ---------------------------- Load Master (Parquet) ----------------------------
 try:
-    if src_path:
-        base = _load_master_from_path(src_path)
-        st.caption(f"Loaded {len(base)} tickers from Excel master at **{src_path}** (sheet '{MASTER_SHEET}').")
-    elif uploaded is not None:
-        base = _load_master_from_bytes(uploaded.getvalue())
-        st.caption(f"Loaded {len(base)} tickers from uploaded file (sheet '{MASTER_SHEET}').")
-    else:
-        st.error("Could not find 'ETF project.xlsm'. Place it in ./data or project root, or upload it above.")
-        st.stop()
+    base = _load_master_from_parquet(MASTER_PARQUET)
+    st.caption(f"Loaded {len(base)} tickers from **{MASTER_PARQUET}**.")
 except Exception as e:
-    st.error(f"Failed to load master: {e}")
+    st.error(f"Failed to load master parquet: {e}")
     st.stop()
 
 if base is None or base.empty:
-    st.error("No tickers were loaded from the Excel master.")
+    st.error("No tickers were loaded from the master parquet.")
     st.stop()
+
+# ---------------------------- Add tickers for this run ----------------------------
+st.subheader("Optional: Add tickers for this run")
+new_raw = st.text_input(
+    "Add ticker(s) (comma or space separated, e.g., `SPY, EFA VEA`)",
+    value="",
+    help="They’ll be UPPERCASED automatically and only used for this run."
+)
+
+if new_raw.strip():
+    parts = re.split(r"[,\s]+", new_raw.strip())
+    parts = [re.sub(r"[^A-Z0-9\.\-\_]", "", p.upper()) for p in parts if p]
+    parts = [p for p in parts if p]  # drop empties after cleanup
+    add = sorted(set(parts) - set(base["Ticker"]))
+    if add:
+        st.success(f"Adding {len(add)} new tickers: {', '.join(add)}")
+        extra = pd.DataFrame({
+            "Ticker": add,
+            "Name": add,                 # minimal metadata for new tickers
+            "URL": ["" for _ in add],
+            "Brand": ["" for _ in add],
+            "Category": ["" for _ in add],
+            "Region": ["" for _ in add],
+            "Expense Ratio (%)": [np.nan for _ in add],
+        })
+        base = pd.concat([base, extra], ignore_index=True).drop_duplicates(subset=["Ticker"])
+    else:
+        st.info("No new unique tickers to add.")
 
 tickers: List[str] = base["Ticker"].tolist()
 
@@ -455,17 +567,46 @@ except Exception as e:
         "NAV","Prem/Disc to NAV %","Yield % (Yahoo)","Expense Ratio (Yahoo %)","Net Assets (USD)"
     ])
 
+# ---------------------------- History via Cache + Tail ----------------------------
+# 1) Try cached parquet first
+hist_map: Dict[str, pd.Series] = _load_cached_history(CACHE_PARQUET, tickers)
+
+# 2) If cache missing or missing tickers, fetch those from Yahoo (fallback)
+missing = [t for t in tickers if t not in hist_map or hist_map[t] is None or hist_map[t].empty]
+if missing:
+    st.caption(f"Fetching history from Yahoo for {len(missing)} missing tickers (first run or uncached).")
+    try:
+        fresh = _fetch_history_yahoo(missing, period=hist_period)
+    except Exception as e:
+        st.warning(f"History Yahoo fallback failed: {e}")
+        fresh = {}
+    for t in missing:
+        ser = fresh.get(t)
+        if ser is not None:
+            hist_map[t] = ser
+
+# 3) Append only the recent tail (~5 trading days via ~10d calendar window)
+hist_map = _append_latest_5d(hist_map, tickers)
+
+# (Optional) write back a trimmed 300-day cache if environment permits writes
 try:
-    hist_map = _fetch_history_yahoo(tickers, period=hist_period)
-except Exception as e:
-    st.warning(f"History download failed: {e}")
-    hist_map = {}
+    rows = []
+    for t, s in hist_map.items():
+        if s is not None and len(s):
+            df_t = s.reset_index()
+            df_t.columns = ["Date", "Close"]
+            df_t["Ticker"] = t
+            rows.append(df_t)
+    if rows:
+        new_df = pd.concat(rows, ignore_index=True)
+        new_df = new_df.sort_values(["Ticker", "Date"])
+        new_df = new_df.groupby("Ticker", as_index=False, group_keys=False).tail(300)  # MA200+H support
+        CACHE_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+        new_df.to_parquet(CACHE_PARQUET, index=False)
+except Exception:
+    pass  # ignore write errors (e.g., read-only container)
 
-
-# ---------------------------- Historical Fetch ----------------------------
-hist_map = _fetch_history_yahoo(tickers, period=hist_period)
-
-# Empirical probability per ticker
+# ----------------- Empirical Probability per ticker -----------------
 bin_edges = np.arange(-3.0, 3.0 + float(bin_width), float(bin_width))
 results = []
 for t in tickers:
@@ -481,6 +622,9 @@ for t in tickers:
 
 prob_df = pd.DataFrame(results, columns=["Stat Buy Prob (%)", "Current Z", "Empirical Coverage (%)"])
 prob_df["Ticker"] = tickers
+
+# ----------------- Assemble final DF: base meta + snapshot + probabilities -----------------
+df = base.merge(px, on="Ticker", how="left")
 df = df.merge(prob_df, on="Ticker", how="left")
 
 # ---------------------------- Summary + Top 10 (dynamic by selected MA) ----------------------------
@@ -499,11 +643,12 @@ with c1:
     st.metric(f"Count below {ma_for_signal}-day MA", f"{count_below_sel}")
 with c2:
     st.caption(
-        f"Statistical Buy Prob uses Method #1 on Yahoo history over {hist_period}, "
-        f"MA={ma_for_signal}, H={H}, ε={eps} (vectorized)."
+        f"Statistical Buy Prob uses Method #1 on cached+recent Yahoo history, "
+        f"MA={ma_for_signal}, H={H}, ε={eps} (robust). "
+        f"If the current bin is sparse, we merge neighbors or fall back to unconditional."
     )
 
-# ---------- NEW: split Top 10 into left list (hyperlinked tickers) and right scatter plot ----------
+# ---------- Top 10: left list (hyperlinks) + right scatter ----------
 st.subheader(f"Top 10 • Potential Mean Reversion (below {ma_for_signal}-day MA)")
 if top10.empty:
     st.write(f"No entries currently below their {ma_for_signal}-day MA.")
@@ -514,7 +659,6 @@ else:
     with left:
         for _, r in top10.iterrows():
             ptxt = "" if pd.isna(r["Stat Buy Prob (%)"]) else f" • Stat Prob: {r['Stat Buy Prob (%)']:.1f}%"
-            # make ticker a markdown link when URL exists
             if pd.notna(r.get("URL")) and str(r.get("URL")).strip():
                 ticker_md = f"[{r['Ticker']}]({r['URL']})"
             else:
@@ -523,7 +667,7 @@ else:
                 f"- **{r['Name']} ({ticker_md})** — {abs(r[selected_pct_col]):.2f}% below {ma_for_signal}d MA{ptxt}"
             )
 
-    # Right: scatter plot of depth vs probability with ticker labels
+    # Right: scatter plot of depth vs probability with ticker labels (always tries to render)
     with right:
         import matplotlib.pyplot as plt
 
@@ -531,35 +675,64 @@ else:
         plot_df["Depth Below MA %"] = plot_df[selected_pct_col].abs()
         plot_df["Prob %"] = plot_df["Stat Buy Prob (%)"]
 
-        plot_df = plot_df[plot_df["Prob %"].notna() & plot_df["Depth Below MA %"].notna()]
-        if plot_df.empty:
-            st.info("Not enough data to plot the scatter (need valid probability and depth for at least one ticker).")
-        else:
-            fig, ax = plt.subplots(figsize=(6.0, 4.2), dpi=150)
-            ax.scatter(plot_df["Depth Below MA %"], plot_df["Prob %"])
+        # Fallback for any missing probability: unconditional rate so chart can still render
+        def _fallback_prob_from_series(s: pd.Series, ma_window: int, H: int, eps: float) -> Optional[float]:
+            if s is None or len(s) < (ma_window + H + 20):
+                return None
+            mu = s.rolling(ma_window, min_periods=ma_window).mean()
+            sd = s.rolling(ma_window, min_periods=ma_window).std(ddof=0)
+            valid = (~mu.isna()) & (sd > 0)
+            if valid.sum() < (ma_window + H):
+                return None
+            z = ((s - mu) / sd).where(np.isfinite((s - mu) / sd))
+            abs_z = z.abs()
+            fwd_min = abs_z.shift(-1).rolling(window=H, min_periods=H).min()
+            hit = (fwd_min <= eps).astype(float).where(fwd_min.notna())
+            base = float(np.nanmean(hit))
+            return 100.0 * base if np.isfinite(base) else None
 
-            # annotate each point with ticker
-            for _, row in plot_df.iterrows():
+        if plot_df["Prob %"].isna().any():
+            fill_vals = []
+            for _, r in plot_df.iterrows():
+                if pd.isna(r["Prob %"]):
+                    s = hist_map.get(r["Ticker"])
+                    val = _fallback_prob_from_series(s, int(ma_for_signal), int(H), float(eps))
+                    fill_vals.append(val)
+                else:
+                    fill_vals.append(r["Prob %"])
+            plot_df["Prob %"] = fill_vals
+
+        plot_df2 = plot_df[plot_df["Prob %"].notna() & plot_df["Depth Below MA %"].notna()]
+        n = len(plot_df2)
+        # Dynamic size so all labels fit (esp. when you truly have 10)
+        fig_h = max(4.2, 0.45 * max(1, n) + 2.0)
+        fig_w = 7.8
+
+        if not plot_df2.empty:
+            fig, ax = plt.subplots(figsize=(fig_w, fig_h), dpi=150)
+            ax.scatter(plot_df2["Depth Below MA %"], plot_df2["Prob %"])
+            for _, row in plot_df2.iterrows():
                 ax.annotate(
                     row["Ticker"],
                     (row["Depth Below MA %"], row["Prob %"]),
-                    xytext=(4, 3),
+                    xytext=(5, 4),
                     textcoords="offset points",
-                    fontsize=8
+                    fontsize=9
                 )
-
             ax.set_xlabel(f"Depth below {ma_for_signal}-day MA (%)")
             ax.set_ylabel(f"Stat Buy Prob (%) (H={H}, ε={eps})")
             ax.set_title("Top 10: Mean-Reversion Setup")
-            # neat limits
-            x_max = float(plot_df["Depth Below MA %"].max()) if not plot_df["Depth Below MA %"].empty else 0.0
-            y_max = float(plot_df["Prob %"].max()) if not plot_df["Prob %"].empty else 0.0
-            ax.set_xlim(left=0, right=max(5.0, x_max * 1.15))
-            ax.set_ylim(bottom=0, top=max(50.0, y_max * 1.10))
+            x_max = float(plot_df2["Depth Below MA %"].max())
+            y_max = float(plot_df2["Prob %"].max())
+            ax.set_xlim(left=0, right=max(5.0, x_max * 1.20 + 1.0))
+            ax.set_ylim(bottom=0, top=max(50.0, y_max * 1.15 + 2.0))
+            ax.margins(x=0.08, y=0.12)
             ax.grid(True, alpha=0.3)
-
+            plt.tight_layout()
             st.pyplot(fig, clear_figure=True)
-# ----------------------------------------------------------------------------------------------------
+        else:
+            # last resort (should be rare with 5y cache)
+            st.info("Not enough valid points to plot.")
 
 st.divider()
 st.subheader("All Instruments • Sort columns, search, and download")
@@ -571,7 +744,7 @@ display = {
     "Category": df["Category"],
     "Region": df["Region"],
     "Expense Ratio (%)": df["Expense Ratio (%)"],
-    "Expense Ratio (net, Yahoo %)": df["Expense Ratio (Yahoo %)"],
+    "Expense Ratio (Yahoo %)": df["Expense Ratio (Yahoo %)"],
     "Yield % (Yahoo)": df["Yield % (Yahoo)"],
     "Net Assets (USD)": df["Net Assets (USD)"],
     "NAV": df["NAV"],
@@ -587,7 +760,7 @@ display = {
 display_cols = pd.DataFrame(display)
 
 # Auto-hide Yahoo-only columns if completely empty
-for maybe_empty in ["Expense Ratio (net, Yahoo %)", "Yield % (Yahoo)"]:
+for maybe_empty in ["Expense Ratio (Yahoo %)", "Yield % (Yahoo)"]:
     if maybe_empty in display_cols and display_cols[maybe_empty].notna().sum() == 0:
         display_cols.drop(columns=[maybe_empty], inplace=True)
 
@@ -606,10 +779,13 @@ final_cols = pinned + new_order
 colcfg = {}
 for c in ["Price", "50d MA", "200d MA", "NAV"]:
     if c in display_cols.columns: colcfg[c] = st.column_config.NumberColumn(format="%.2f")
-for c in ["Price vs 50d %", "Price vs 200d %", "Prem/Disc to NAV %", "Expense Ratio (%)", "Expense Ratio (net, Yahoo %)", "Yield % (Yahoo)"]:
+for c in ["Price vs 50d %", "Price vs 200d %", "Prem/Disc to NAV %", "Expense Ratio (%)", "Expense Ratio (Yahoo %)", "Yield % (Yahoo)"]:
     if c in display_cols.columns: colcfg[c] = st.column_config.NumberColumn(format="%.2f%%")
 if "Net Assets (USD)" in display_cols.columns:
     colcfg["Net Assets (USD)"] = st.column_config.NumberColumn(format="$%,.0f")
+
+# One-line caption showing cache vs. fresh, and that a small tail was appended
+st.caption(f"History source • Parquet cache: {len(tickers) - len(missing)} tickers | Yahoo (new/uncached): {len(missing)} | + recent ~5 trading days appended")
 
 st.dataframe(display_cols[final_cols], use_container_width=True, column_config=colcfg)
 
@@ -617,7 +793,6 @@ csv_bytes = display_cols[final_cols].to_csv(index=False).encode("utf-8")
 st.download_button("Download table (CSV)", data=csv_bytes, file_name="etf_metrics.csv", mime="text/csv")
 
 st.caption(
-    "Empirical probability (Method #1): bucket historical z-scores vs the selected MA; "
-    "for each bucket, compute the fraction of cases that touch |z| ≤ ε within H days. "
-    "If the current bin is sparse, we back off to neighboring bins."
+    "Empirical probability (Robust Method #1): bucket historical z-scores vs the selected MA; "
+    "if the current bin is sparse, we merge neighboring bins and, if needed, fall back to the unconditional hit rate."
 )

@@ -8,6 +8,23 @@ from datetime import date
 st.set_page_config(page_title="Margin Optimization", page_icon="📈", layout="wide")
 st.title("Rivard Labs - Innocap: Margin Requirement Estimator")
 
+# Hide sidebar/nav and block page if not authed
+if not st.session_state.get("is_authed"):
+    st.markdown("""
+        <style>
+            [data-testid="stSidebar"] {display:none !important;}
+            [data-testid="stSidebarNav"] {display:none !important;}
+            [data-testid="collapsedControl"] {display:none !important;}
+        </style>
+    """, unsafe_allow_html=True)
+
+    # If Streamlit supports switch_page in your version, you can redirect:
+    try:
+        from streamlit.runtime.scriptrunner import add_script_run_ctx  # just to probe internal API
+        st.switch_page("Home.py")  # works in recent Streamlit versions
+    except Exception:
+        st.stop()  # hard stop if switch_page isn't available
+        
 # ----------------------------
 # EDIT THESE PLACEHOLDER WEIGHTS LATER
 # ----------------------------

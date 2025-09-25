@@ -1,6 +1,21 @@
-﻿.venv/
+# Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# Streamlit
 .streamlit/secrets.toml
-data/*.xlsx
-data/*.xlsm
+
+# OS/editor
+.DS_Store
+Thumbs.db
+
+# Optional: local caches/tmp
+data/cache/
