@@ -1,7 +1,19 @@
 import os
 import streamlit as st
 
-def _get_secret(key, default=""):
+def get_secret(key, default=""):
+    # Prefer environment variables (Render), then Streamlit secrets if present
+    val = os.environ.get(key)
+    if val is not None:
+        return val
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+import os
+import streamlit as st
+
+def get_secret(key, default=""):
     try:
         if key in st.secrets:
             return st.secrets[key]
@@ -25,15 +37,15 @@ def _hide_sidebar_nav():
         </style>
     """, unsafe_allow_html=True)
 
-def _get_secret(key: str) -> str | None:
+def get_secret(key: str) -> str | None:
     # Prefer Streamlit secrets (local dev), then environment (Render)
     if key in st.secrets:
         return str(st.secrets[key])
     return os.getenv(key)
 
 # ---------- credentials (secrets only) ----------
-BASIC_USER = (_get_secret("BASIC_USER") or "").strip().lower()
-BASIC_PASS = _get_secret("BASIC_PASS") or ""
+BASIC_USER = (get_secret("BASIC_USER") or "").strip().lower()
+BASIC_PASS = get_secret("BASIC_PASS") or ""
 
 def auth_ok(email: str, password: str) -> bool:
     return (email.strip().lower() == BASIC_USER) and (password == BASIC_PASS)
@@ -72,4 +84,5 @@ st.write("Use the links below to open pages:")
 st.page_link("pages/01_Company_Search.py", label="Company Search", icon="🔎")
 st.page_link("pages/02_ETF_Mean_Reversion.py", label="ETF Mean Reversion", icon="📈")
 st.page_link("pages/03_Margin__Optimization.py", label="Margin Optimization", icon="⚖️")
+
 
