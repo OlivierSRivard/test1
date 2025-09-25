@@ -1,12 +1,8 @@
-services:
+﻿services:
   - type: web
     name: fintechapp
     env: docker
     plan: free
     region: oregon
-    # Render reads Dockerfile; no start command needed
-    envVars:
-      - key: PORT
-        value: 10000
     healthCheckPath: /
     autoDeploy: true
